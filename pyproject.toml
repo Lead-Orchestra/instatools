@@ -1,0 +1,19 @@
+[project]
+name = "instatools"
+version = "0.1.0"
+description = "Instagram automation tools - collection of scripts for Instagram automation"
+requires-python = ">=3.8"
+dependencies = [
+    "instaloader==4.10",
+    "requests==2.32.4",
+    "colorama==0.4.6",
+    "prettytable==3.8.0",
+    "instagrapi==1.16.30",
+    "rich==12.6.0",
+    "tabulate==0.9.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
