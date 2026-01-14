@@ -27,6 +27,34 @@ RED = Fore.RED
 YELLOW = Fore.YELLOW
 CYAN = Fore.CYAN
 
+def configure_proxy():
+    """
+    Configure proxy settings from environment variables.
+    The requests library (used by instaloader) respects HTTP_PROXY, HTTPS_PROXY environment variables.
+    """
+    proxy_host = os.getenv('PROXY_HOST')
+    proxy_port = os.getenv('PROXY_PORT')
+    proxy_username = os.getenv('PROXY_USERNAME')
+    proxy_password = os.getenv('PROXY_PASSWORD')
+    proxy_protocol = os.getenv('PROXY_PROTOCOL', 'http').lower()
+    
+    if not proxy_host or not proxy_port:
+        return  # No proxy configuration
+    
+    # Build proxy URL
+    if proxy_username and proxy_password:
+        proxy_url = f"{proxy_protocol}://{proxy_username}:{proxy_password}@{proxy_host}:{proxy_port}"
+    else:
+        proxy_url = f"{proxy_protocol}://{proxy_host}:{proxy_port}"
+    
+    # Set environment variables that requests library respects
+    os.environ['HTTP_PROXY'] = proxy_url
+    os.environ['HTTPS_PROXY'] = proxy_url
+    os.environ['http_proxy'] = proxy_url
+    os.environ['https_proxy'] = proxy_url
+    
+    print(f"{CYAN}[*] Proxy configured: {proxy_protocol}://{proxy_host}:{proxy_port}")
+
 def extract_followers(username: str, session_file: str, output_format: str = 'json', output_file: str = None, limit: int = None):
     """
     Extract followers from an Instagram user
@@ -38,6 +66,9 @@ def extract_followers(username: str, session_file: str, output_format: str = 'js
         output_file: Output file path (optional, will auto-generate if not provided)
     """
     try:
+        # Configure proxy if environment variables are set
+        configure_proxy()
+        
         # Initialize Instaloader
         loader = instaloader.Instaloader()
         
