@@ -10,6 +10,7 @@ import json
 import csv
 import argparse
 import os
+import time
 from pathlib import Path
 from datetime import datetime
 
@@ -69,8 +70,16 @@ def extract_followers(username: str, session_file: str, output_format: str = 'js
         # Configure proxy if environment variables are set
         configure_proxy()
         
-        # Initialize Instaloader
-        loader = instaloader.Instaloader()
+        # Initialize Instaloader with rate limit handling
+        loader = instaloader.Instaloader(
+            sleep=True,  # Enable automatic rate limit handling
+            max_connection_attempts=3,
+            request_timeout=300.0
+        )
+        
+        # Configure context for better rate limit handling
+        loader.context.max_connection_attempts = 3
+        loader.context.request_timeout = 300.0
         
         # Load session if provided
         if session_file:
@@ -140,74 +149,238 @@ def extract_followers(username: str, session_file: str, output_format: str = 'js
         followers = []
         follower_count = 0
         total_followers = profile.followers
+        partial_success = False
+        
+        # Rate limiting configuration
+        delay_between_followers = float(os.getenv('INSTAGRAM_RATE_LIMIT_DELAY', '0.5'))  # Default 0.5s between followers
+        delay_every_n_followers = int(os.getenv('INSTAGRAM_LONG_DELAY_INTERVAL', '100'))  # Every 100 followers
+        long_delay_seconds = float(os.getenv('INSTAGRAM_LONG_DELAY', '5.0'))  # 5 second delay every N followers
+        max_retries = int(os.getenv('INSTAGRAM_MAX_RETRIES', '3'))  # Max retries for 401 errors
+        
+        # Retry logic state
+        consecutive_401_count = 0
         
         try:
-            for follower in profile.get_followers():
-                follower_data = {
-                    'username': follower.username,
-                    'full_name': follower.full_name,
-                    'user_id': follower.userid,
-                    'is_verified': follower.is_verified,
-                    'is_private': follower.is_private,
-                    'profile_pic_url': follower.profile_pic_url,
-                    'biography': follower.biography,
-                    'followers': follower.followers,
-                    'followees': follower.followees,
-                    'profile_url': f"https://instagram.com/{follower.username}/"
-                }
-                followers.append(follower_data)
-                follower_count += 1
-                
-                # Show progress more frequently for large accounts
-                if follower_count % 50 == 0:
-                    progress_pct = (follower_count / total_followers * 100) if total_followers > 0 else 0
-                    print(f"\n{CYAN}[*] Extracted {follower_count}/{total_followers} followers ({progress_pct:.1f}%)...")
-                elif follower_count % 10 == 0:
-                    # Less verbose updates every 10
-                    sys.stdout.write(f"\r{CYAN}[*] Extracting... {follower_count} followers so far")
-                    sys.stdout.flush()
-                
-                # Stop if limit is reached
-                if limit and follower_count >= limit:
-                    print(f"\n{YELLOW}[!] Reached limit of {limit} followers. Stopping extraction.")
+            followers_iterator = profile.get_followers()
+            
+            while True:
+                try:
+                    # Get next follower with retry logic
+                    retry_count = 0
+                    follower = None
+                    fetch_error = None
+                    
+                    while retry_count < max_retries:
+                        try:
+                            follower = next(followers_iterator)
+                            consecutive_401_count = 0  # Reset on success
+                            break
+                        except StopIteration:
+                            # End of followers
+                            follower = None
+                            break
+                        except Exception as err:
+                            error_msg = str(err).lower()
+                            fetch_error = err
+                            
+                            # Check if it's a 401 error
+                            is_401 = '401' in str(err) or 'unauthorized' in error_msg or 'login required' in error_msg
+                            
+                            if is_401:
+                                consecutive_401_count += 1
+                                
+                                # Exponential backoff: 2^retry_count seconds
+                                backoff_delay = min(2 ** retry_count, 60)  # Cap at 60 seconds
+                                
+                                # Additional delay if multiple consecutive 401s
+                                if consecutive_401_count > 1:
+                                    backoff_delay *= consecutive_401_count
+                                
+                                # If we have followers, save partial results and continue with longer delay
+                                if len(followers) > 0:
+                                    print(f"\n{YELLOW}[!] HTTP 401 error encountered ({consecutive_401_count} consecutive). Rate limited?")
+                                    print(f"{YELLOW}[!] Backing off for {backoff_delay:.1f} seconds... (Have {len(followers)} followers so far)")
+                                    
+                                    # Save partial results before retrying
+                                    partial_success = True
+                                    try:
+                                        temp_output_file = output_file or f"followers_{username}.{output_format}"
+                                        if output_format.lower() == 'json':
+                                            temp_path = Path(temp_output_file)
+                                            with open(temp_path, 'w', encoding='utf-8') as f:
+                                                json.dump({
+                                                    'target_username': username,
+                                                    'target_full_name': profile.full_name,
+                                                    'total_followers': len(followers),
+                                                    'extracted_at': datetime.now().isoformat(),
+                                                    'partial': True,
+                                                    'followers': followers
+                                                }, f, indent=2, ensure_ascii=False)
+                                            print(f"{GREEN}[OK] Partial results saved ({len(followers)} followers)")
+                                    except Exception as save_error:
+                                        print(f"{YELLOW}[!] Could not save partial results: {save_error}")
+                                
+                                time.sleep(backoff_delay)
+                                retry_count += 1
+                                
+                                # If we've exhausted retries and have no followers, fail
+                                if retry_count >= max_retries and len(followers) == 0:
+                                    print(f"{RED}[✘] Max retries reached with no followers collected. Giving up.")
+                                    raise
+                                
+                                # If we've exhausted retries but have followers, save and exit gracefully
+                                if retry_count >= max_retries:
+                                    print(f"{YELLOW}[!] Max retries reached. Saving {len(followers)} collected followers as partial result.")
+                                    partial_success = True
+                                    break
+                            else:
+                                # Non-401 error, re-raise immediately
+                                raise
+                        
+                    # If we couldn't get a follower after retries, break the loop
+                    if follower is None:
+                        if retry_count >= max_retries and len(followers) > 0:
+                            # Partial success - we'll save results outside the loop
+                            break
+                        elif retry_count >= max_retries:
+                            # Complete failure
+                            if fetch_error:
+                                raise fetch_error
+                            break
+                        else:
+                            # Normal end of iteration
+                            break
+                    
+                    # Extract follower data
+                    try:
+                        follower_data = {
+                            'username': follower.username,
+                            'full_name': follower.full_name,
+                            'user_id': follower.userid,
+                            'is_verified': follower.is_verified,
+                            'is_private': follower.is_private,
+                            'profile_pic_url': follower.profile_pic_url,
+                            'biography': follower.biography,
+                            'followers': follower.followers,
+                            'followees': follower.followees,
+                            'profile_url': f"https://instagram.com/{follower.username}/"
+                        }
+                        followers.append(follower_data)
+                        follower_count += 1
+                        
+                        # Rate limiting: small delay between followers
+                        if delay_between_followers > 0:
+                            time.sleep(delay_between_followers)
+                        
+                        # Rate limiting: longer delay every N followers
+                        if delay_every_n_followers > 0 and follower_count % delay_every_n_followers == 0:
+                            print(f"\n{YELLOW}[!] Pausing {long_delay_seconds}s to avoid rate limits ({follower_count} followers collected)...")
+                            time.sleep(long_delay_seconds)
+                        
+                        # Show progress more frequently for large accounts
+                        if follower_count % 50 == 0:
+                            progress_pct = (follower_count / total_followers * 100) if total_followers > 0 else 0
+                            print(f"\n{CYAN}[*] Extracted {follower_count}/{total_followers} followers ({progress_pct:.1f}%)...")
+                        elif follower_count % 10 == 0:
+                            # Less verbose updates every 10
+                            sys.stdout.write(f"\r{CYAN}[*] Extracting... {follower_count} followers so far")
+                            sys.stdout.flush()
+                        
+                        # Stop if limit is reached
+                        if limit and follower_count >= limit:
+                            print(f"\n{YELLOW}[!] Reached limit of {limit} followers. Stopping extraction.")
+                            break
+                            
+                    except Exception as process_error:
+                        # Error processing individual follower, log and continue
+                        print(f"\n{YELLOW}[!] Error processing follower: {process_error}")
+                        print(f"{YELLOW}[!] Continuing with next follower...")
+                        continue
+                        
+                except StopIteration:
+                    # Normal end of followers
                     break
                     
         except Exception as e:
-            print(f"{RED}[✘] Error extracting followers: {e}")
-            if "login" in str(e).lower() or "private" in str(e).lower():
-                print(f"{YELLOW}[!] This profile may be private. Please ensure you're logged in with a session file.")
-            raise
-        
-        print(f"{GREEN}[OK] Successfully extracted {len(followers)} followers!")
+            error_msg = str(e).lower()
+            is_401 = '401' in str(e) or 'unauthorized' in error_msg or 'login required' in error_msg
+            
+            # If we have followers collected, save them before failing
+            if len(followers) > 0:
+                print(f"\n{RED}[✘] Error extracting followers: {e}")
+                print(f"{YELLOW}[!] Saving {len(followers)} collected followers as partial result...")
+                partial_success = True
+                
+                # Save partial results
+                try:
+                    temp_output_file = output_file or f"followers_{username}.{output_format}"
+                    temp_path = Path(temp_output_file)
+                    if output_format.lower() == 'json':
+                        with open(temp_path, 'w', encoding='utf-8') as f:
+                            json.dump({
+                                'target_username': username,
+                                'target_full_name': profile.full_name,
+                                'total_followers': len(followers),
+                                'extracted_at': datetime.now().isoformat(),
+                                'partial': True,
+                                'error': str(e),
+                                'followers': followers
+                            }, f, indent=2, ensure_ascii=False)
+                        print(f"{GREEN}[OK] Partial results saved to {temp_path}")
+                    # Don't re-raise if we saved partial results and it's a 401
+                    if is_401:
+                        print(f"{YELLOW}[!] Continuing with partial results due to 401 error (likely rate limiting)")
+                        # Don't re-raise, allow partial success
+                    else:
+                        raise  # Re-raise non-401 errors
+                except Exception as save_error:
+                    print(f"{RED}[✘] Could not save partial results: {save_error}")
+                    raise  # Re-raise if we couldn't save
+            else:
+                # No followers collected, fail normally
+                print(f"{RED}[✘] Error extracting followers: {e}")
+                if "login" in error_msg or "private" in error_msg or is_401:
+                    print(f"{YELLOW}[!] This may be due to rate limiting or session expiration.")
+                    print(f"{YELLOW}[!] Please ensure you're logged in with a valid session file.")
+                raise
         
         # Determine output file
         if not output_file:
             output_file = f"followers_{username}.{output_format}"
         
-        # Save to file
+        # Save to file (only if not already saved as partial)
         output_path = Path(output_file)
-        print(f"{CYAN}[*] Saving to {output_path}...")
-        
-        if output_format.lower() == 'json':
-            with open(output_path, 'w', encoding='utf-8') as f:
-                json.dump({
-                    'target_username': username,
-                    'target_full_name': profile.full_name,
-                    'total_followers': len(followers),
-                    'extracted_at': datetime.now().isoformat(),
-                    'followers': followers
-                }, f, indent=2, ensure_ascii=False)
-        elif output_format.lower() == 'csv':
-            with open(output_path, 'w', newline='', encoding='utf-8') as f:
-                if followers:
-                    writer = csv.DictWriter(f, fieldnames=followers[0].keys())
-                    writer.writeheader()
-                    writer.writerows(followers)
+        if not partial_success or not output_path.exists():
+            print(f"{CYAN}[*] Saving to {output_path}...")
+            
+            if output_format.lower() == 'json':
+                with open(output_path, 'w', encoding='utf-8') as f:
+                    json.dump({
+                        'target_username': username,
+                        'target_full_name': profile.full_name,
+                        'total_followers': len(followers),
+                        'extracted_at': datetime.now().isoformat(),
+                        'partial': partial_success,
+                        'followers': followers
+                    }, f, indent=2, ensure_ascii=False)
+            elif output_format.lower() == 'csv':
+                with open(output_path, 'w', newline='', encoding='utf-8') as f:
+                    if followers:
+                        writer = csv.DictWriter(f, fieldnames=followers[0].keys())
+                        writer.writeheader()
+                        writer.writerows(followers)
+            else:
+                raise ValueError(f"Unsupported output format: {output_format}")
         else:
-            raise ValueError(f"Unsupported output format: {output_format}")
+            print(f"{GREEN}[OK] Partial results already saved to {output_path}")
+        
+        if partial_success:
+            print(f"{YELLOW}[!] Partial extraction completed: {len(followers)} followers saved (may have been interrupted by rate limiting)")
+        else:
+            print(f"{GREEN}[OK] Successfully extracted {len(followers)} followers!")
         
         print(f"{GREEN}[OK] Saved {len(followers)} followers to {output_path}")
-        return output_path, followers
+        return output_path, followers, partial_success
         
     except instaloader.exceptions.ProfileNotExistsException:
         print(f"{RED}[X] Error: Profile @{username} does not exist")
@@ -274,16 +447,25 @@ Examples:
             output_file = f"followers_{username}.{args.format}"
         
         try:
-            output_path, followers = extract_followers(
+            result = extract_followers(
                 username=username,
                 session_file=args.session,
                 output_format=args.format,
                 output_file=output_file,
                 limit=args.limit
             )
+            
+            # Handle both old format (2 values) and new format (3 values)
+            if len(result) == 3:
+                output_path, followers, partial = result
+            else:
+                output_path, followers = result
+                partial = False
+            
             results[username] = {
                 'output_file': str(output_path),
-                'count': len(followers)
+                'count': len(followers),
+                'partial': partial
             }
         except Exception as e:
             print(f"{RED}[✘] Failed to extract followers from @{username}: {e}")
@@ -297,7 +479,8 @@ Examples:
         if 'error' in result:
             print(f"{RED}[✘] @{username}: {result['error']}")
         else:
-            print(f"{GREEN}[OK] @{username}: {result['count']} followers saved to {result['output_file']}")
+            partial_marker = " (partial)" if result.get('partial', False) else ""
+            print(f"{GREEN}[OK] @{username}: {result['count']} followers saved to {result['output_file']}{partial_marker}")
 
 
 if __name__ == '__main__':
